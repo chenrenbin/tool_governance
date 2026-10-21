@@ -85,14 +85,10 @@ class RunShellArgs(StrictArgs):
     command: str = Field(min_length=1, max_length=200)
 
 
-# ===== TODO(任务 2)：定义转账参数模型 =====
-# 新建 TransferArgs 类，继承 StrictArgs，三个字段：
-#   from_account: str   正则约束 ^ACC-[A-Z]-[0-9]{6}$
-#   to_account:   str   正则约束同上
-#   amount:       float gt=0 且 le=100_000
-# 参考上面的 CreateRefundArgs 怎么写 Field 约束。
 class TransferArgs(StrictArgs):
-    """TODO(任务 2)：补全 from_account / to_account / amount 三个字段。"""
+    from_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
+    to_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
+    amount: float = Field(gt=0, le=100_000)
 
 
 ArgsModel = GetOrderArgs | CreateRefundArgs | RunShellArgs | TransferArgs
@@ -300,9 +296,11 @@ def _redact(value: Any) -> Any:
         return [_redact(item) for item in value]
     if isinstance(value, str):
         value = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "***@***", value)
-        # ===== TODO(任务 6)：在这里追加账号脱敏 =====
-        # 把 ACC-A-123456 变成 ACC-A-****3456（保留字符前缀与末 4 位）。
-        # 提示：re.sub 的替换既可以是字符串，也可以是函数，两种都行。
+        value = re.sub(
+            r"\bACC-[A-Z]-[0-9]{6}\b",
+            lambda match: f"{match.group()[:6]}****{match.group()[-4:]}",
+            value,
+        )
         return value
     return value
 
@@ -598,15 +596,12 @@ ORDERS = {
         "customer_email": "alice@example.com",
     }
 }
-# ===== TODO(任务 1)：新增模拟账户数据 =====
-# 在 ORDERS 后面新建 ACCOUNTS：Key 为 (tenant_id, account_id)，Value 为余额（float）。
-# 预设数据（来自作业任务 1）：
-#   ("tenant_a", "ACC-A-123456"): 100_000.0
-#   ("tenant_a", "ACC-A-654321"): 5_000.0
-#   ("tenant_a", "ACC-A-888888"): 20_000.0
-#   ("tenant_b", "ACC-B-111111"): 50_000.0
-# 注意：ACCOUNTS 是模块级可变状态，测试会按用例快照还原，所以必须写成可变的 dict。
-ACCOUNTS: dict[tuple[str, str], float] = {}
+ACCOUNTS: dict[tuple[str, str], float] = {
+    ("tenant_a", "ACC-A-123456"): 100_000.0,
+    ("tenant_a", "ACC-A-654321"): 5_000.0,
+    ("tenant_a", "ACC-A-888888"): 20_000.0,
+    ("tenant_b", "ACC-B-111111"): 50_000.0,
+}
 SIDE_EFFECTS = {"refund_executions": 0, "shell_executions": 0}
 
 
@@ -637,16 +632,14 @@ async def refund_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -
         raise PolicyDenied("BUSINESS_RULE_DENIED", "退款金额超过可退金额")
 
 
-# ===== TODO(任务 3)：实现业务预检 =====
-# 异步函数 transfer_precheck(args, context)：只做判断，不改余额，
-# 按下面的顺序检查，不满足就 raise PolicyDenied（参考上面的 refund_precheck）：
-#   1. 金额落进教学拦截区间 50000 < amount <= 80000 → PolicyDenied("EXCEED_LIMIT", ...)
-#      这是教学专用规则，不是真实单笔限额：amount > 80000 的调用必须能过预检，
-#      留给任务 4 的超时分支使用。
-#   2. 从 ACCOUNTS 查 (context.tenant_id, from_account) 的余额，小于 amount
-#      → PolicyDenied("INSUFFICIENT_BALANCE", ...)
 async def transfer_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -> None:
-    raise NotImplementedError("TODO(任务 3)：请实现 transfer_precheck")
+    arguments = raw_arguments
+    assert isinstance(arguments, TransferArgs)
+    if 50_000 < arguments.amount <= 80_000:
+        raise PolicyDenied("EXCEED_LIMIT", "单笔转账金额超过教学限额")
+    available = ACCOUNTS.get((context.tenant_id, arguments.from_account), 0.0)
+    if available < arguments.amount:
+        raise PolicyDenied("INSUFFICIENT_BALANCE", "转出账户余额不足")
 
 
 async def create_refund_handler(
@@ -667,20 +660,28 @@ async def create_refund_handler(
     }
 
 
-# ===== TODO(任务 4)：实现转账处理函数 =====
-# 异步函数 transfer_handler(tool_call_id, args, context)（参考上面的 create_refund_handler）：
-#   1. 超时模拟：amount > 80000 时先 await asyncio.sleep(3.0)，并且这一句必须在扣款之前，
-#      让框架的 asyncio.timeout 先掐断执行。
-#   2. 转入账户不存在 → raise PolicyDenied("ACCOUNT_NOT_FOUND", "转入账户不存在")，
-#      即 (context.tenant_id, to_account) 不在 ACCOUNTS 里就报错。
-#   3. 改余额：转出账户扣 amount，转入账户加 amount。
-#   4. 返回 dict：txn_id（tool_call_id 后 6 位）、from、to、amount、status="accepted"。
 async def transfer_handler(
     tool_call_id: str,
     raw_arguments: ArgsModel,
     context: ExecutionContext,
 ) -> Mapping[str, Any]:
-    raise NotImplementedError("TODO(任务 4)：请实现 transfer_handler")
+    arguments = raw_arguments
+    assert isinstance(arguments, TransferArgs)
+    if arguments.amount > 80_000:
+        await asyncio.sleep(3.0)
+    to_key = (context.tenant_id, arguments.to_account)
+    if to_key not in ACCOUNTS:
+        raise PolicyDenied("ACCOUNT_NOT_FOUND", "转入账户不存在")
+    from_key = (context.tenant_id, arguments.from_account)
+    ACCOUNTS[from_key] -= arguments.amount
+    ACCOUNTS[to_key] += arguments.amount
+    return {
+        "txn_id": tool_call_id[-6:],
+        "from": arguments.from_account,
+        "to": arguments.to_account,
+        "amount": arguments.amount,
+        "status": "accepted",
+    }
 
 
 async def simulated_shell_handler(
@@ -725,15 +726,18 @@ def build_tools() -> list[ToolDefinition]:
             handler=simulated_shell_handler,
             canonical_target=lambda args: str(getattr(args, "command")),
         ),
-        # ===== TODO(任务 5)：在这里注册 transfer 工具 =====
-        # 在 return 列表末尾追加一个 ToolDefinition，参考上面的 create_refund：
-        #   name="transfer"，description 自拟
-        #   parameters_model=TransferArgs
-        #   handler=transfer_handler，precheck=transfer_precheck
-        #   canonical_target 要能区分不同参数组合（审批摘要用它做参数绑定）
-        #   policy 参考同类写操作工具：Effect.WRITE、应当需要人工审批、
-        #   permission 用 "transfer:execute"、非幂等、max_retries=0；
-        #   timeout_seconds 必须小于任务 4 里超时演示的 3 秒。
+        ToolDefinition(
+            name="transfer",
+            description="在当前租户的两个账户之间转账",
+            parameters_model=TransferArgs,
+            policy=ToolPolicy(Effect.WRITE, Risk.HIGH, "transfer:execute", True, 1.0, 0, False),
+            handler=transfer_handler,
+            precheck=transfer_precheck,
+            canonical_target=lambda args: (
+                f"{getattr(args, 'from_account')}:{getattr(args, 'to_account')}:"
+                f"{getattr(args, 'amount')}"
+            ),
+        ),
     ]
 
 
